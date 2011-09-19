@@ -31,7 +31,7 @@ if test "x$HAVE_PKGCONFIG" = "xno"; then
 fi
 
 # Checks for header files.
-AC_CHECK_HEADERS([stdio.h stdlib.h fcntl.h string.h getopt.h byteswap.h netinet/in.h])
+AC_CHECK_HEADERS([stdio.h stdlib.h fcntl.h string.h getopt.h byteswap.h netinet/in.h netinet/in.h assert.h sys/socket.h sys/un.h unistd.h stdbool.h openssl/bn.h openssl/sha.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_TYPE_SIZE_T

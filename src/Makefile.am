@@ -1,5 +1,5 @@
 bin_PROGRAMS = bdremux
 bdremux_SOURCES = bdremux.c
 bdremux_CFLAGS = $(GST_PLUGINS_BASE_CFLAGS) $(GST_CFLAGS)
-bdremux_LDADD = $(GST_LIBS)
+bdremux_LDADD = $(GST_LIBS) -lcrypto
 noinst_HEADERS = 

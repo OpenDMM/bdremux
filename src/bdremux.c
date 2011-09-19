@@ -27,9 +27,16 @@
 #include <glib.h>
 #include <glib/gprintf.h>
 #include <getopt.h>
-
 #include <byteswap.h>
 #include <netinet/in.h>
+#include <assert.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <openssl/bn.h>
+#include <openssl/sha.h>
+#include "tpmd.h"
 
 #ifndef BYTE_ORDER
 #error no byte order defined!
@@ -48,6 +55,278 @@
 
 GST_DEBUG_CATEGORY (bdremux_debug);
 #define GST_CAT_DEFAULT bdremux_debug
+
+static const unsigned char tpm_root_mod[128] = {
+	0x9F,0x7C,0xE4,0x47,0xC9,0xB4,0xF4,0x23,0x26,0xCE,0xB3,0xFE,0xDA,0xC9,0x55,0x60,
+	0xD8,0x8C,0x73,0x6F,0x90,0x9B,0x5C,0x62,0xC0,0x89,0xD1,0x8C,0x9E,0x4A,0x54,0xC5,
+	0x58,0xA1,0xB8,0x13,0x35,0x45,0x02,0xC9,0xB2,0xE6,0x74,0x89,0xDE,0xCD,0x9D,0x11,
+	0xDD,0xC7,0xF4,0xE4,0xE4,0xBC,0xDB,0x9C,0xEA,0x7D,0xAD,0xDA,0x74,0x72,0x9B,0xDC,
+	0xBC,0x18,0x33,0xE7,0xAF,0x7C,0xAE,0x0C,0xE3,0xB5,0x84,0x8D,0x0D,0x8D,0x9D,0x32,
+	0xD0,0xCE,0xD5,0x71,0x09,0x84,0x63,0xA8,0x29,0x99,0xDC,0x3C,0x22,0x78,0xE8,0x87,
+	0x8F,0x02,0x3B,0x53,0x6D,0xD5,0xF0,0xA3,0x5F,0xB7,0x54,0x09,0xDE,0xA7,0xF1,0xC9,
+	0xAE,0x8A,0xD7,0xD2,0xCF,0xB2,0x2E,0x13,0xFB,0xAC,0x6A,0xDF,0xB1,0x1D,0x3A,0x3F,
+};
+
+static unsigned char level2_cert[210];
+static unsigned char level3_cert[210];
+
+static bool send_cmd(int fd, enum tpmd_cmd cmd, const void *data, unsigned int len)
+{
+	unsigned char buf[len + 4];
+
+	buf[0] = (cmd >> 8) & 0xff;
+	buf[1] = (cmd >> 0) & 0xff;
+	buf[2] = (len >> 8) & 0xff;
+	buf[3] = (len >> 0) & 0xff;
+	memcpy(&buf[4], data, len);
+
+	if (write(fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+		fprintf(stderr, "%s: incomplete write\n", __func__);
+		return false;
+	}
+
+	return true;
+}
+
+static void *recv_cmd(int fd, unsigned int *tag, unsigned int *len)
+{
+	unsigned char buf[4];
+	void *val;
+
+	if (read(fd, buf, 4) != 4) {
+		fprintf(stderr, "%s: incomplete read\n", __func__);
+		return NULL;
+	}
+
+	*tag = (buf[0] << 8) | buf[1];
+	*len = (buf[2] << 8) | buf[3];
+
+	val = malloc(*len);
+	if (val == NULL)
+		return NULL;
+
+	if (read(fd, val, *len) != (ssize_t)*len) {
+		fprintf(stderr, "%s: incomplete read\n", __func__);
+		free(val);
+		return NULL;
+	}
+
+	return val;
+}
+
+static void parse_data(const unsigned char *data, unsigned int datalen)
+{
+	unsigned int i, j;
+	unsigned int tag;
+	unsigned int len;
+	const unsigned char *val;
+
+	for (i = 0; i < datalen; i += len) {
+		tag = data[i++];
+		len = data[i++];
+		val = &data[i];
+
+#if 0
+		printf("tag=%02x len=%02x val=", tag, len);
+		for (j = 0; j < len; j++)
+			printf("%02x", val[j]);
+		printf("\n");
+#endif
+
+		switch (tag) {
+		case TPMD_DT_LEVEL2_CERT:
+			if (len != 210)
+				break;
+			memcpy(level2_cert, val, 210);
+			break;
+		case TPMD_DT_LEVEL3_CERT:
+			if (len != 210)
+				break;
+			memcpy(level3_cert, val, 210);
+			break;
+		}
+	}
+}
+
+static void rsa_pub1024(unsigned char dest[128],
+			const unsigned char src[128],
+			const unsigned char mod[128])
+{
+	BIGNUM bbuf, bexp, bmod;
+	BN_CTX *ctx;
+
+	ctx = BN_CTX_new();
+	BN_init(&bbuf);
+	BN_init(&bexp);
+	BN_init(&bmod);
+
+	BN_bin2bn(src, 128, &bbuf);
+	BN_bin2bn(mod, 128, &bmod);
+	BN_bin2bn((const unsigned char *)"\x01\x00\x01", 3, &bexp);
+
+	BN_mod_exp(&bbuf, &bbuf, &bexp, &bmod, ctx);
+
+	BN_bn2bin(&bbuf, dest);
+
+	BN_clear_free(&bexp);
+	BN_clear_free(&bmod);
+	BN_clear_free(&bbuf);
+	BN_CTX_free(ctx);
+}
+
+static bool decrypt_block(unsigned char dest[128],
+			  const unsigned char *src,
+			  unsigned int len,
+			  const unsigned char mod[128])
+{
+	unsigned char hash[20];
+	SHA_CTX ctx;
+
+	if ((len != 128) &&
+	    (len != 202))
+		return false;
+
+	rsa_pub1024(dest, src, mod);
+
+	SHA1_Init(&ctx);
+	SHA1_Update(&ctx, &dest[1], 106);
+	if (len == 202)
+		SHA1_Update(&ctx, &src[131], 61);
+	SHA1_Final(hash, &ctx);
+
+	return (memcmp(hash, &dest[107], 20) == 0);
+}
+
+static bool validate_cert(unsigned char dest[128],
+			  const unsigned char src[210],
+			  const unsigned char mod[128])
+{
+	unsigned char buf[128];
+
+	if (!decrypt_block(buf, &src[8], 210 - 8, mod))
+		return false;
+
+	memcpy(&dest[0], &buf[36], 71);
+	memcpy(&dest[71], &src[131 + 8], 57);
+	return true;
+}
+
+static bool verify_signature(const unsigned char *val, unsigned int len,
+			     const unsigned char challenge[8])
+{
+	unsigned char level2_mod[128];
+	unsigned char level3_mod[128];
+	unsigned char buf[128];
+
+	if (len != 128) {
+		fprintf(stderr, "invalid length: %u\n", len);
+		return false;
+	}
+
+	if (!validate_cert(level2_mod, level2_cert, tpm_root_mod)) {
+		fprintf(stderr, "could not verify level2 cert\n");
+		return false;
+	}
+	if (!validate_cert(level3_mod, level3_cert, level2_mod)) {
+		fprintf(stderr, "could not verify level3 cert\n");
+		return false;
+	}
+	if (!decrypt_block(buf, val, 128, level3_mod)) {
+		fprintf(stderr, "could not decrypt signed block\n");
+		return false;
+	}
+
+	if (memcmp(&buf[80], challenge, 8)) {
+		fprintf(stderr, "challenge does not match\n");
+		return false;
+	}
+
+	return true;
+}
+
+static bool read_random(unsigned char *buf, size_t len)
+{
+	ssize_t ret;
+	int fd;
+
+	fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0) {
+		perror("/dev/urandom");
+		return false;
+	}
+
+	ret = read(fd, buf, len);
+
+	close(fd);
+
+	if (ret != (ssize_t)len) {
+		fprintf(stderr, "could not read random data\n");
+		return false;
+	}
+
+	return true;
+}
+
+static bool tpm_check(void)
+{
+	struct sockaddr_un addr;
+	unsigned char buf[8];
+	unsigned int tag, len;
+	unsigned char *val;
+	int fd;
+	bool ret;
+
+	addr.sun_family = AF_UNIX;
+	strcpy(addr.sun_path, TPMD_SOCKET);
+
+	fd = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		return false;
+	}
+
+	if (connect(fd, (const struct sockaddr *)&addr, SUN_LEN(&addr)) < 0) {
+		perror("connect");
+		return false;
+	}
+
+	/* read data */
+	buf[0] = TPMD_DT_LEVEL2_CERT;
+	buf[1] = TPMD_DT_LEVEL3_CERT;
+	if (!send_cmd(fd, TPMD_CMD_GET_DATA, buf, 2))
+		return false;
+
+	val = recv_cmd(fd, &tag, &len);
+	if (val == NULL)
+		return false;
+
+	/* process data */
+	assert(tag == TPMD_CMD_GET_DATA);
+	parse_data(val, len);
+	free(val);
+
+	/* read random bytes */
+	if (!read_random(buf, 8))
+		return false;
+
+	/* sign challenge */
+	if (!send_cmd(fd, TPMD_CMD_COMPUTE_SIGNATURE, buf, 8))
+		return false;
+
+	val = recv_cmd(fd, &tag, &len);
+	if (val == NULL)
+		return false;
+
+	/* process signed challenge */
+	assert(tag == TPMD_CMD_COMPUTE_SIGNATURE);
+
+	ret = verify_signature(val, len, buf);
+		  
+	free(val);
+
+	close(fd);
+	return ret;
+}
 
 typedef struct _App App;
 
@@ -719,6 +998,10 @@ usage:
 int
 main (int argc, char *argv[])
 {
+  if (tpm_check() != true) {
+    bdremux_errout("TPM challenge failed! This tool can only run on genuine Dreambox models!");
+  }
+
   App *app = &s_app;
   GstBus *bus;
   int i;
